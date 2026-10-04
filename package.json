@@ -1,0 +1,21 @@
+{
+  "name": "flex-tupup-backend-deploy-ready",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FLEX TUPUP backend - wallet deposits, admin confirmation, orders, games and packs.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check db.js && node --check auth.js && node --check routes.js",
+    "test": "node scripts/contract-test.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.16.3"
+  }
+}

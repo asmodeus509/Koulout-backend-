@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: flex-tupup-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_NAME
+        value: FLEX TUPUP Admin
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: MAX_WALLET_DEPOSIT
+        value: 500000
+      - key: MIN_WALLET_DEPOSIT
+        value: 1
