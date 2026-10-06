@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tutoriel Flex Tupup</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;padding:0;background:#fff;font-family:Arial,sans-serif;color:#111}
+    .tutorial{width:100%;max-width:900px;margin:20px auto;padding:15px}
+    .tutorial h1{margin:0 0 8px;font-size:24px;font-weight:800}
+    .tutorial p{margin:0 0 15px;color:#666;font-size:15px}
+    .video-box{width:100%;background:#000;border-radius:14px;overflow:hidden}
+    video{display:block;width:100%;height:auto;max-height:600px;background:#000}
+    .loading{padding:30px 15px;text-align:center;color:#777;background:#fff}
+    .error{display:none;padding:20px;text-align:center;color:#d00;background:#fff}
+    @media(max-width:600px){
+      .tutorial{margin:10px auto;padding:10px}
+      .tutorial h1{font-size:20px}
+      .video-box{border-radius:10px}
+    }
+  </style>
+</head>
+<body>
+
+<section class="tutorial" id="tutorialSection">
+  <h1 id="tutorialTitle">Tutoriel Flex Tupup</h1>
+  <p id="tutorialSubtitle"></p>
+
+  <div class="video-box">
+    <div class="loading" id="tutorialLoading">
+      Chargement du tutoriel...
+    </div>
+
+    <video id="tutorialVideo"
+           controls
+           playsinline
+           preload="metadata"
+           style="display:none;">
+    </video>
+
+    <div class="error" id="tutorialError">
+      Impossible de charger le tutoriel pour le moment.
+    </div>
+  </div>
+</section>
+
+<script>
+  const BACKEND_URL = "https://flex-backend-v0ak.onrender.com";
+
+  async function loadTutorial() {
+    const section = document.getElementById("tutorialSection");
+    const title = document.getElementById("tutorialTitle");
+    const subtitle = document.getElementById("tutorialSubtitle");
+    const video = document.getElementById("tutorialVideo");
+    const loading = document.getElementById("tutorialLoading");
+    const error = document.getElementById("tutorialError");
+
+    try {
+      const response = await fetch(BACKEND_URL + "/tutorial", {
+        method: "GET",
+        cache: "no-cache"
+      });
+
+      if (!response.ok) throw new Error("Erreur serveur");
+
+      const data = await response.json();
+      const tutorial = data.tutorial;
+
+      if (!tutorial || tutorial.active !== true) {
+        section.style.display = "none";
+        return;
+      }
+
+      if (tutorial.title) title.textContent = tutorial.title;
+
+      if (tutorial.subtitle) {
+        subtitle.textContent = tutorial.subtitle;
+      } else {
+        subtitle.style.display = "none";
+      }
+
+      let videoUrl = tutorial.videoUrl;
+      if (!videoUrl) throw new Error("Aucune vidéo configurée");
+
+      if (videoUrl.startsWith("/")) {
+        videoUrl = BACKEND_URL.replace(/\/$/, "") + videoUrl;
+      }
+
+      video.src = videoUrl;
+
+      video.addEventListener("loadedmetadata", function () {
+        loading.style.display = "none";
+        video.style.display = "block";
+      }, { once:true });
+
+      video.addEventListener("error", function () {
+        loading.style.display = "none";
+        video.style.display = "none";
+        error.style.display = "block";
+      }, { once:true });
+
+      video.load();
+
+    } catch (err) {
+      console.error("Tutorial error:", err);
+      loading.style.display = "none";
+      error.style.display = "block";
+    }
+  }
+
+  loadTutorial();
+</script>
+
+</body>
+</html>
