@@ -17,10 +17,12 @@ const CFG = {
     users: 'users',                      // id, name (ou pseudo)
     deposits: 'wallet_deposits',         // id, user_id, amount, status, transaction_reference, confirmed_at
     wallets: 'wallets',                  // user_id, balance
-    orders: 'orders',                    // id, user_id, pack (texte), diamonds (int), status, created_at
+    orders: 'orders',                    // id, user_id, game, pack, diamonds, price, player_id, account_name, phone, status, payment, client_order_id, created_at
+    packs: 'packs',                      // id, game_id/game, name, qty, price  (pour relire le VRAI prix côté serveur)
+    tx: 'wallet_transactions',           // journal du wallet (créé par SQL_MIGRATION)
   },
-  // commandes comptées dans le Top: livrées / validées / payées (pas en attente ni refusées)
-  orderDoneRegex: '^(valid|pay|livr|deliver|complet|termin|success|done)',
+  // commandes comptées dans le Top = toutes les commandes payées avec le wallet, SAUF refusées/annulées
+  orderRefusedRegex: '^(refus|rejet|reject|annul|cancel|fail|chou)',
   userPseudoCol: 'name',                 // colonne affichée dans le Top (jamais email/téléphone)
   leaderboardSize: 100,
 };
@@ -44,6 +46,18 @@ CREATE TABLE IF NOT EXISTS security_blocks (
 );
 ALTER TABLE ${CFG.t.orders} ADD COLUMN IF NOT EXISTS diamonds INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS orders_month_idx ON ${CFG.t.orders} (created_at);
+-- JOURNAL DU WALLET: chaque mouvement est écrit une seule fois (le solde ne "revient" jamais en arrière tout seul)
+CREATE TABLE IF NOT EXISTS ${CFG.t.tx} (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('deposit_credit','order_debit','order_refund')),
+  amount NUMERIC NOT NULL,        -- + crédit / - débit
+  ref TEXT NOT NULL,              -- id du dépôt ou de la commande
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (type, ref)
+);
+ALTER TABLE ${CFG.t.orders} ADD COLUMN IF NOT EXISTS client_order_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS orders_client_unique ON ${CFG.t.orders} (user_id, client_order_id) WHERE client_order_id IS NOT NULL;
 -- un même code de transaction ne peut jamais être utilisé deux fois
 CREATE UNIQUE INDEX IF NOT EXISTS wallet_deposits_tx_unique ON ${CFG.t.deposits} (lower(transaction_reference));
 CREATE INDEX IF NOT EXISTS wallet_deposits_confirmed_idx ON ${CFG.t.deposits} (confirmed_at) WHERE status = 'confirmed';
@@ -128,6 +142,7 @@ function router({ pool, requireAuth, requireAdmin }) {
         `INSERT INTO ${T.wallets} (user_id, balance) VALUES ($1, $2)
          ON CONFLICT (user_id) DO UPDATE SET balance = ${T.wallets}.balance + EXCLUDED.balance
          RETURNING balance`, [dep.user_id, dep.amount]);
+      await client.query(`INSERT INTO ${T.tx} (user_id, type, amount, ref) VALUES ($1,'deposit_credit',$2,$3) ON CONFLICT DO NOTHING`, [String(dep.user_id), dep.amount, String(dep.id)]);
       await client.query('COMMIT');
       res.json({ ok: true, deposit: { id: dep.id, status: 'confirmed', amount: Number(dep.amount) }, balance: Number(w.rows[0].balance) });
     } catch (e) {
@@ -142,6 +157,93 @@ function router({ pool, requireAuth, requireAdmin }) {
     if (!rowCount) return res.status(409).json({ error: 'Dépôt introuvable ou déjà traité.' });
     res.json({ ok: true });
   });
+
+
+  /* ========== 1b) COMMANDE PAYÉE AVEC LE WALLET — DÉBIT ATOMIQUE CÔTÉ SERVEUR ==========
+     Remplace ton ancien POST /orders. Une seule transaction: verrou du wallet -> contrôle du solde -> commande -> débit -> journal.
+     Le solde ne dépend jamais du navigateur. Le prix est relu en base quand le pack est trouvé. */
+  r.post('/orders', requireAuth, async (req, res) => {
+    const b = req.body || {};
+    const uid = String(req.user.id);
+    if (req.flexBlockedUsers && req.flexBlockedUsers.has(uid)) return res.status(403).json({ error: 'Compte bloqué.' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // idempotence: le même client_order_id ne débite jamais deux fois
+      const cid = String(b.client_order_id || b.order_id || b.id || '').slice(0, 80) || null;
+      if (cid) {
+        const ex = await client.query(`SELECT * FROM ${T.orders} WHERE user_id = $1 AND client_order_id = $2`, [uid, cid]);
+        if (ex.rows[0]) {
+          const w0 = await client.query(`SELECT balance FROM ${T.wallets} WHERE user_id = $1`, [uid]);
+          await client.query('ROLLBACK');
+          return res.json({ ok: true, order: ex.rows[0], balance: Number(w0.rows[0]?.balance || 0), duplicate: true });
+        }
+      }
+      // prix serveur
+      let price = Number(b.price ?? b.amount), diamonds = Number(b.diamonds) || 0;
+      try {
+        const pk = await client.query(
+          `SELECT price, qty FROM ${T.packs} WHERE (id::text = $1 OR lower(name) = lower($2)) LIMIT 1`,
+          [String(b.pack_id || ''), String(b.pack || b.plan || '')]);
+        if (pk.rows[0]) { price = Number(pk.rows[0].price); diamonds = Number(pk.rows[0].qty) || diamonds; }
+        else await logEvent(pool, req, 'price_unverified', 'medium', { pack: b.pack, price }, uid);
+      } catch (_) { /* table packs différente: on garde le prix reçu mais on le signale */ }
+      if (!Number.isFinite(price) || price <= 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Prix invalide.' }); }
+
+      const w = await client.query(`SELECT balance FROM ${T.wallets} WHERE user_id = $1 FOR UPDATE`, [uid]);
+      const bal = Number(w.rows[0]?.balance || 0);
+      if (bal < price) { await client.query('ROLLBACK'); return res.status(402).json({ insufficient: true, error: 'Solde insuffisant.', balance: bal }); }
+
+      const o = await client.query(
+        `INSERT INTO ${T.orders} (user_id, game, pack, diamonds, price, player_id, account_name, phone, status, payment, client_order_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'En attente','Wallet',$9) RETURNING *`,
+        [uid, b.game || null, b.pack || b.plan || null, diamonds, price, b.playerId || b.player_id || b.uid || null,
+         b.accountName || b.account_name || null, b.phone || b.customerPhone || null, cid]);
+      const nb = await client.query(`UPDATE ${T.wallets} SET balance = balance - $2 WHERE user_id = $1 RETURNING balance`, [uid, price]);
+      await client.query(`INSERT INTO ${T.tx} (user_id, type, amount, ref) VALUES ($1,'order_debit',$2,$3)`, [uid, -price, String(o.rows[0].id)]);
+      await client.query('COMMIT');
+      res.json({ ok: true, order: o.rows[0], balance: Number(nb.rows[0].balance) });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      res.status(500).json({ error: 'Erreur serveur.' });
+    } finally { client.release(); }
+  });
+
+  /* ========== 1c) ADMIN: VALIDER / REFUSER UNE COMMANDE ==========
+     Valider = AUCUN changement de solde (le client a déjà payé).  Refuser = remboursement UNE seule fois. */
+  async function setOrderStatus(req, res) {
+    const status = String((req.body && req.body.status) || '').trim();
+    if (!status) return res.status(400).json({ error: 'status requis.' });
+    const refused = new RegExp(CFG.orderRefusedRegex, 'i').test(status);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const q = await client.query(`SELECT * FROM ${T.orders} WHERE id::text = $1 FOR UPDATE`, [req.params.id]);
+      const o = q.rows[0];
+      if (!o) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Commande introuvable.' }); }
+      const wasRefused = new RegExp(CFG.orderRefusedRegex, 'i').test(String(o.status || ''));
+      if (wasRefused && !refused) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Commande déjà refusée.' }); }
+      await client.query(`UPDATE ${T.orders} SET status = $2 WHERE id = $1`, [o.id, status]);
+      let balance = null;
+      if (refused && !wasRefused && /wallet/i.test(String(o.payment || ''))) {
+        const ins = await client.query(
+          `INSERT INTO ${T.tx} (user_id, type, amount, ref) VALUES ($1,'order_refund',$2,$3) ON CONFLICT DO NOTHING RETURNING id`,
+          [String(o.user_id), Number(o.price), String(o.id)]);
+        if (ins.rows[0]) {
+          const nb = await client.query(`UPDATE ${T.wallets} SET balance = balance + $2 WHERE user_id = $1 RETURNING balance`, [o.user_id, o.price]);
+          balance = Number(nb.rows[0].balance);
+        }
+      }
+      await client.query('COMMIT');
+      res.json({ ok: true, order: { ...o, status }, refunded: balance != null, balance });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      res.status(500).json({ error: 'Erreur serveur.' });
+    } finally { client.release(); }
+  }
+  r.patch('/admin/orders/:id', requireAuth, requireAdmin, setOrderStatus);
+  r.patch('/admin/orders/:id/status', requireAuth, requireAdmin, setOrderStatus);
+  r.put('/admin/orders/:id', requireAuth, requireAdmin, setOrderStatus);
 
   /* ========== 2) JOURNAL DE SÉCURITÉ (admin) ========== */
   r.get('/admin/security/events', requireAuth, requireAdmin, async (req, res) => {
@@ -167,7 +269,7 @@ function router({ pool, requireAuth, requireAdmin }) {
   });
 
   /* ========== 3) TOP 100 DIAMANTS DU MOIS (public: pseudo + nombre de diamants, jamais d'argent) ========== */
-  // Classement = total de 💎 des commandes livrées/validées ce mois (heure d'Haïti).
+  // Classement = total de 💎 des commandes payées ce mois (heure d'Haïti), les refusées/annulées sont retirées.
   // Calculé à chaque requête => si quelqu'un dépasse un autre il prend sa place, et tout repart à zéro le 1er du mois (sans cron).
   r.get('/leaderboard/monthly', async (req, res) => {
     const q = await pool.query(
@@ -177,17 +279,17 @@ function router({ pool, requireAuth, requireAdmin }) {
                          NULLIF(regexp_replace(substring(COALESCE(pack,'') from '(\\d[\\d\\s.,]*)\\s*(?:[Dd][Ii][Aa][Mm]|💎)'), '[^0-9]', '', 'g'), '')::bigint,
                          0) AS dia
            FROM ${T.orders}
-          WHERE status ~* $1
+          WHERE status !~* $1
             AND created_at >= date_trunc('month', now() AT TIME ZONE $2) AT TIME ZONE $2)
        SELECT u.id AS uid, u.${CFG.userPseudoCol} AS pseudo, SUM(o.dia)::bigint AS diamonds, MIN(o.created_at) AS first_at
          FROM o JOIN ${T.users} u ON u.id = o.user_id
         GROUP BY u.id, u.${CFG.userPseudoCol}
        HAVING SUM(o.dia) > 0
         ORDER BY diamonds DESC, first_at ASC
-        LIMIT $3`, [CFG.orderDoneRegex, CFG.tz, CFG.leaderboardSize]);
+        LIMIT $3`, [CFG.orderRefusedRegex, CFG.tz, CFG.leaderboardSize]);
     const me = req.user && String(req.user.id);
     // Jamais d'email, de téléphone ni de montant en argent.
-    res.set('Cache-Control', 'public, max-age=30').json({
+    res.set('Cache-Control', 'no-store').json({
       month: new Date().toISOString().slice(0, 7),
       top: q.rows.map((x, i) => ({ rank: i + 1, pseudo: x.pseudo, diamonds: Number(x.diamonds), me: me ? String(x.uid) === me : false })),
     });
