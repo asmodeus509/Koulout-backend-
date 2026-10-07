@@ -17,10 +17,12 @@ const CFG = {
     users: 'users',                      // id, name (ou pseudo)
     deposits: 'wallet_deposits',         // id, user_id, amount, status, transaction_reference, confirmed_at
     wallets: 'wallets',                  // user_id, balance
+    orders: 'orders',                    // id, user_id, pack (texte), diamonds (int), status, created_at
   },
+  // commandes comptées dans le Top: livrées / validées / payées (pas en attente ni refusées)
+  orderDoneRegex: '^(valid|pay|livr|deliver|complet|termin|success|done)',
   userPseudoCol: 'name',                 // colonne affichée dans le Top (jamais email/téléphone)
-  depositConfirmedValues: ['confirmed'], // statut final d'un dépôt validé
-  leaderboardSize: 20,
+  leaderboardSize: 100,
 };
 
 const SQL_MIGRATION = `
@@ -40,6 +42,8 @@ CREATE TABLE IF NOT EXISTS security_blocks (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (kind, value)
 );
+ALTER TABLE ${CFG.t.orders} ADD COLUMN IF NOT EXISTS diamonds INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS orders_month_idx ON ${CFG.t.orders} (created_at);
 -- un même code de transaction ne peut jamais être utilisé deux fois
 CREATE UNIQUE INDEX IF NOT EXISTS wallet_deposits_tx_unique ON ${CFG.t.deposits} (lower(transaction_reference));
 CREATE INDEX IF NOT EXISTS wallet_deposits_confirmed_idx ON ${CFG.t.deposits} (confirmed_at) WHERE status = 'confirmed';
@@ -162,23 +166,30 @@ function router({ pool, requireAuth, requireAdmin }) {
     res.json({ ok: true });
   });
 
-  /* ========== 3) TOP RECHARGES DU MOIS (public: pseudo seulement) ========== */
-  // Calculé à chaque requête sur le mois courant (heure d'Haïti) => se réinitialise tout seul le 1er du mois, sans cron.
+  /* ========== 3) TOP 100 DIAMANTS DU MOIS (public: pseudo + nombre de diamants, jamais d'argent) ========== */
+  // Classement = total de 💎 des commandes livrées/validées ce mois (heure d'Haïti).
+  // Calculé à chaque requête => si quelqu'un dépasse un autre il prend sa place, et tout repart à zéro le 1er du mois (sans cron).
   r.get('/leaderboard/monthly', async (req, res) => {
-    const ok = CFG.depositConfirmedValues;
     const q = await pool.query(
-      `SELECT u.${CFG.userPseudoCol} AS pseudo, SUM(d.amount) AS total, u.id AS uid
-         FROM ${T.deposits} d JOIN ${T.users} u ON u.id = d.user_id
-        WHERE d.status = ANY($1)
-          AND d.confirmed_at >= date_trunc('month', now() AT TIME ZONE $2) AT TIME ZONE $2
+      `WITH o AS (
+         SELECT user_id, created_at,
+                COALESCE(NULLIF(diamonds, 0),
+                         NULLIF(regexp_replace(substring(COALESCE(pack,'') from '(\\d[\\d\\s.,]*)\\s*(?:[Dd][Ii][Aa][Mm]|💎)'), '[^0-9]', '', 'g'), '')::bigint,
+                         0) AS dia
+           FROM ${T.orders}
+          WHERE status ~* $1
+            AND created_at >= date_trunc('month', now() AT TIME ZONE $2) AT TIME ZONE $2)
+       SELECT u.id AS uid, u.${CFG.userPseudoCol} AS pseudo, SUM(o.dia)::bigint AS diamonds, MIN(o.created_at) AS first_at
+         FROM o JOIN ${T.users} u ON u.id = o.user_id
         GROUP BY u.id, u.${CFG.userPseudoCol}
-        ORDER BY total DESC, min(d.confirmed_at) ASC
-        LIMIT $3`, [ok, CFG.tz, CFG.leaderboardSize]);
+       HAVING SUM(o.dia) > 0
+        ORDER BY diamonds DESC, first_at ASC
+        LIMIT $3`, [CFG.orderDoneRegex, CFG.tz, CFG.leaderboardSize]);
     const me = req.user && String(req.user.id);
-    // On n'envoie JAMAIS le montant, l'email ni le téléphone: seulement rang + pseudo.
-    res.set('Cache-Control', 'public, max-age=60').json({
+    // Jamais d'email, de téléphone ni de montant en argent.
+    res.set('Cache-Control', 'public, max-age=30').json({
       month: new Date().toISOString().slice(0, 7),
-      top: q.rows.map((x, i) => ({ rank: i + 1, pseudo: x.pseudo, me: me ? String(x.uid) === me : false })),
+      top: q.rows.map((x, i) => ({ rank: i + 1, pseudo: x.pseudo, diamonds: Number(x.diamonds), me: me ? String(x.uid) === me : false })),
     });
   });
 
