@@ -414,3 +414,7 @@ function router({ pool, requireAuth, requireAdmin }) {
 }
 
 module.exports = { init, guard, router, logEvent, parseDiamonds, CFG, _state: S };
+const flex = require('./flex-backend-module');
+flex.init(pool).catch(e => console.error('[FLEX] init', e));
+app.use(flex.guard(pool));
+app.use(flex.router({ pool, requireAuth, requireAdmin }));
