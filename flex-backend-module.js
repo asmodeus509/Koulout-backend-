@@ -7,7 +7,8 @@
  *  - POST /orders           : commande payée avec le wallet = UNE transaction (verrou → solde → commande liée au client → débit)
  *  - GET  /orders           : chaque client voit SES commandes (filtrées par son compte)
  *  - PATCH|PUT /admin/orders/:id[/status] : Valider (aucun mouvement d'argent) / Refuser (remboursement 1 seule fois)
- *  - POST /admin/deposits/:id/confirm : bloque toute tentative de changer le montant d'un dépôt (+ journal de sécurité)
+ *  - POST /admin/deposits/:id/confirm : l'admin peut CORRIGER le montant réellement reçu (prérempli avec le montant du client);
+ *                                       chaque correction est journalisée (montant déclaré, montant crédité, admin)
  *  - GET  /leaderboard/monthly : Top 100 diamants du mois (pseudo + diamants, jamais d'argent), reset automatique le 1er
  *  - Sécurité: limiteur, IP/users bloqués, journal des tentatives, routes admin /admin/security/*
  *
@@ -27,6 +28,7 @@ const express = require('express');
 const CFG = {
   tz: 'America/Port-au-Prince',
   leaderboardSize: 100,
+  maxDeposit: 1_000_000,          // plafond d'un dépôt confirmé par l'admin (HTG)
   refusedRegex: '^(refus|rejet|reject|annul|cancel|fail|chou)',
 };
 
@@ -119,7 +121,12 @@ async function init(pool) {
       table: depTable,
       amount: ['amount', 'amount_htg'].find(c => c in dc) || null,
       status: ['status'].find(c => c in dc) || null,
+      user: ['user_id', 'userid', 'customer_id'].find(c => c in dc) || null,
     };
+    for (const [k, col, type] of [['original', 'original_amount', 'NUMERIC'], ['note', 'admin_note', 'TEXT'], ['by', 'confirmed_by', 'TEXT'], ['at', 'confirmed_at', 'TIMESTAMPTZ']]) {
+      if (!(col in dc)) await q(`ALTER TABLE ${ident(depTable)} ADD COLUMN IF NOT EXISTS ${col} ${type}`);
+      D[k] = col;
+    }
   }
 
   /* ---- stockage du solde ---- */
@@ -350,18 +357,44 @@ function router({ pool, requireAuth, requireAdmin }) {
   r.patch('/admin/orders/:id/status', requireAuth, requireAdmin, setOrderStatus);
   r.put('/admin/orders/:id', requireAuth, requireAdmin, setOrderStatus);
 
-  /* ---------- D) DÉPÔT: montant verrouillé (garde, puis ton ancienne route confirme) ---------- */
+  /* ---------- D) DÉPÔT: confirmation avec montant corrigeable par l'admin ---------- */
+  // Le formulaire admin est prérempli avec le montant déclaré par le client; l'admin peut le corriger (ex. 100 -> 165).
+  // Le client est crédité du montant confirmé. Le montant d'origine est gardé (original_amount) et un événement est journalisé.
   r.post('/admin/deposits/:id/confirm', requireAuth, requireAdmin, async (req, res, next) => {
+    if (!S.D || !S.D.amount || !S.D.status || !S.D.user) return next();   // schéma inconnu: ton ancienne route prend le relais
+    const client = await pool.connect();
     try {
-      const sent = req.body && (req.body.amount ?? req.body.amount_htg ?? req.body.value);
-      if (sent == null || !S.D || !S.D.amount) return next();
-      const d = await pool.query(`SELECT ${ident(S.D.amount)} AS amount FROM ${ident(S.D.table)} WHERE id::text = $1`, [String(req.params.id)]);
-      if (d.rows[0] && Number(sent) !== Number(d.rows[0].amount)) {
-        await logEvent(pool, req, 'amount_tamper', 'critical', { deposit_id: req.params.id, stored: Number(d.rows[0].amount), attempted: Number(sent) });
-        return res.status(400).json({ error: 'Le montant d’un dépôt ne peut pas être modifié.' });
+      await client.query('BEGIN');
+      const f = await client.query(`SELECT * FROM ${ident(S.D.table)} WHERE id::text = $1 LIMIT 1 FOR UPDATE`, [String(req.params.id)]);
+      const dep = f.rows[0];
+      if (!dep) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Dépôt introuvable.' }); }
+      if (!/^(pending|en attente)$/i.test(String(dep[S.D.status] || 'pending'))) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Ce dépôt est déjà traité.' }); }
+
+      const declared = Number(dep[S.D.amount]);
+      const raw = req.body && (req.body.amount ?? req.body.amount_htg ?? req.body.value);
+      const finalAmt = (raw == null || raw === '') ? declared : Number(raw);
+      if (!Number.isFinite(finalAmt) || finalAmt <= 0 || finalAmt > CFG.maxDeposit) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Montant invalide (1 à ' + CFG.maxDeposit.toLocaleString('fr-FR') + ' HTG).' });
       }
-    } catch (_) {}
-    next();
+      const note = String((req.body && (req.body.admin_note || req.body.note)) || '').slice(0, 200) || null;
+      const uid = String(dep[S.D.user]);
+
+      await client.query(
+        `UPDATE ${ident(S.D.table)} SET ${ident(S.D.amount)} = $2, ${ident(S.D.status)} = 'confirmed', ${ident(S.D.at)} = now(),
+                ${ident(S.D.original)} = COALESCE(${ident(S.D.original)}, $3), ${ident(S.D.note)} = $4, ${ident(S.D.by)} = $5 WHERE id = $1`,
+        [dep.id, finalAmt, declared, note, req.user ? String(req.user.id) : null]);
+      await lockBalance(client, uid);                       // crée la ligne wallet si besoin + verrou
+      const balance = await addBalance(client, uid, finalAmt);
+      await client.query(`INSERT INTO wallet_transactions (user_id, type, amount, ref) VALUES ($1,'deposit_credit',$2,$3) ON CONFLICT DO NOTHING`, [uid, finalAmt, String(dep.id)]);
+      await client.query('COMMIT');
+      if (finalAmt !== declared) await logEvent(pool, req, 'deposit_amount_adjusted', 'medium', { deposit_id: dep.id, declared, credited: finalAmt, note }, uid);
+      res.json({ ok: true, deposit: { ...dep, id: dep.id, status: 'confirmed', amount: finalAmt, declared_amount: declared }, balance });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      console.error('[FLEX] deposit confirm', e.message);
+      res.status(500).json({ error: 'Erreur serveur.' });
+    } finally { client.release(); }
   });
 
   /* ---------- E) SÉCURITÉ (admin) ---------- */
@@ -414,7 +447,3 @@ function router({ pool, requireAuth, requireAdmin }) {
 }
 
 module.exports = { init, guard, router, logEvent, parseDiamonds, CFG, _state: S };
-const flex = require('./flex-backend-module');
-flex.init(pool).catch(e => console.error('[FLEX] init', e));
-app.use(flex.guard(pool));
-app.use(flex.router({ pool, requireAuth, requireAdmin }));
